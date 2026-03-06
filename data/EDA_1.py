@@ -1,7 +1,7 @@
 import pandas as pd
 import ast
 
-df = pd.read_csv(r"D:\USTH\nlp\final_prj\data\train.csv")
+df = pd.read_csv(r"D:\USTH\nlp\NLP_Sentiment_analysis_and_classification\data\test.csv")
 
 df["label_name"] = df["label_name"].apply(ast.literal_eval)
 
