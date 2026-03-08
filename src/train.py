@@ -141,6 +141,8 @@ def _run_epoch(
     epoch:         int,
     total_epochs:  int,
     threshold:     float = 0.5,
+    amp_dtype:     torch.dtype = torch.float16,
+    use_amp:       bool = True,
 ) -> Tuple[float, float, float, float]:
     """
     Run one forward (+ optional backward) pass.
@@ -310,11 +312,13 @@ def train(config_path: str = "config/config.yaml") -> Dict:
         train_loss, _, _, _ = _run_epoch(
             model, train_loader, criterion, optimizer, scheduler,
             scaler, device, "train", epoch, epochs, threshold,
+            amp_dtype=amp_dtype, use_amp=use_amp,
         )
 
         val_loss, micro_f1, macro_f1, weighted_f1 = _run_epoch(
             model, val_loader, criterion, None, None,
             None, device, "val", epoch, epochs, threshold,
+            amp_dtype=amp_dtype, use_amp=use_amp,
         )
 
         current_lr = optimizer.param_groups[0]["lr"]
