@@ -35,7 +35,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.metrics import f1_score, precision_score, recall_score
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 from transformers import AutoModel
 
@@ -169,7 +169,7 @@ def _run_epoch(
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
 
-            with autocast(enabled=(scaler is not None)):
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 logits = model(input_ids, attention_mask)
                 loss   = criterion(logits, labels)
 
@@ -234,27 +234,52 @@ def train(config_path: str = "config/config.yaml") -> Dict:
     patience  = int(train_cfg.get("early_stopping_patience", 3))
     threshold = float(train_cfg.get("threshold", 0.5))
 
-    # ── Device ──────────────────────────────────────────────────────────────
-    device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_amp = device.type == "cuda"
-    print(f"[train] Device: {device} | AMP: {use_amp}")
+    # ── Device & AMP ────────────────────────────────────────────────────────
+    device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_key  = cfg["model"]["name"].lower()
+    amp_dtype_str = BACKBONE_REGISTRY.get(model_key, {}).get("amp_dtype", "float16")
+
+    # DeBERTa-v3 has fp16 internal params → GradScaler's unscale raises ValueError.
+    # Fix: use bfloat16 autocast (wider range, no overflow scaling needed → no GradScaler).
+    # All other models use standard float16 + GradScaler.
+    if device.type == "cuda" and amp_dtype_str == "bfloat16":
+        use_amp    = True
+        amp_dtype  = torch.bfloat16
+        use_scaler = False          # bfloat16 doesn't need loss scaling
+    elif device.type == "cuda":
+        use_amp    = True
+        amp_dtype  = torch.float16
+        use_scaler = True
+    else:
+        use_amp    = False
+        amp_dtype  = torch.float32
+        use_scaler = False
+
+    print(f"[train] Device: {device} | AMP: {use_amp} ({amp_dtype_str})")
 
     # ── Data ────────────────────────────────────────────────────────────────
     train_loader, val_loader, _, info = get_dataloaders(cfg)
-    pos_weight = info["pos_weight"]
+    pos_weight  = info["pos_weight"]
+    num_labels  = info["num_labels"]
+    label_names = info["label_names"]
 
     # ── Model ───────────────────────────────────────────────────────────────
+    # Override num_labels in cfg so build_model picks up the right head size
+    cfg["data"]["num_emotions"] = num_labels
     model      = build_model(cfg).to(device)
     model_name = cfg["model"]["name"]
+    pretrained_name = BACKBONE_REGISTRY[model_name.lower()]["pretrained"]
     n_params   = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[train] Model: {model_name} | Trainable params: {n_params:,}")
+    print(f"[train] Model     : {model_name}  ({pretrained_name})")
+    print(f"[train] Num labels: {num_labels}  ({info['label_mode']})")
+    print(f"[train] Params    : {n_params:,}")
 
     # ── Loss / Optimizer / Scheduler ────────────────────────────────────────
-    criterion  = get_loss_fn(cfg, device, pos_weight=pos_weight)
-    optimizer  = get_optimizer(model, cfg)
+    criterion   = get_loss_fn(cfg, device, pos_weight=pos_weight)
+    optimizer   = get_optimizer(model, cfg)
     total_steps = len(train_loader) * epochs
-    scheduler  = get_scheduler(optimizer, cfg, num_training_steps=total_steps)
-    scaler     = GradScaler() if use_amp else None
+    scheduler   = get_scheduler(optimizer, cfg, num_training_steps=total_steps)
+    scaler      = GradScaler() if use_scaler else None
 
     # ── Output dirs ─────────────────────────────────────────────────────────
     result_dir = get_result_dir(cfg)
@@ -323,15 +348,19 @@ def train(config_path: str = "config/config.yaml") -> Dict:
             best_epoch        = epoch
             no_improve        = 0
             torch.save({
-                "epoch":        epoch,
-                "model_name":   model_name,
-                "model_state":  model.state_dict(),
-                "optimizer":    optimizer.state_dict(),
-                "scheduler":    scheduler.state_dict() if scheduler else None,
-                "val_loss":     best_val_loss,
-                "val_micro_f1": best_val_micro_f1,
-                "threshold":    threshold,
-                "cfg":          cfg,
+                "epoch":           epoch,
+                "model_name":      model_name,
+                "pretrained_name": pretrained_name,   # no need to read config on load
+                "label_mode":      info["label_mode"],
+                "num_labels":      num_labels,
+                "label_names":     label_names,
+                "model_state":     model.state_dict(),
+                "optimizer":       optimizer.state_dict(),
+                "scheduler":       scheduler.state_dict() if scheduler else None,
+                "val_loss":        best_val_loss,
+                "val_micro_f1":    best_val_micro_f1,
+                "threshold":       threshold,
+                "cfg":             cfg,
             }, ckpt_path)
             print(f"  ✓ Checkpoint saved (epoch {epoch})")
         else:

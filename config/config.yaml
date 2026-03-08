@@ -5,55 +5,60 @@
 
 #  Data
 data:
-  data_dir: "data/"                          # folder containing train/val/test .arrow files
-  max_length: 128                            # max token length (mean ~13 words, max 33 words -> 128 safe)
-  num_emotions: 27                           # emotion classes only (excluding Neutral)
-  neutral_label_idx: 27                      # index of Neutral in the original 28-class scheme
+  data_dir: "data/"                          # folder containing .arrow files
+  max_length: 128                            # mean ~13 words, max 33 → 128 is safe
+  num_emotions: 27                           # overridden at runtime from label_mode
+  neutral_label_idx: 27
   seed: 42
+  # "27class" → fine-grained 27-emotion multi-label (neutral inferred at threshold)
+  # "ekman"   → 7 Ekman groups (anger/disgust/fear/joy/sadness/surprise/neutral)
+  label_mode: "27class"
 
 #  Model
-#  Supported backbones (set model.name to one of the keys below):
-#
-#   Key           HuggingFace ID                           Params   Notes
-#   ----------    -------------------------------------    -------  ----------------------------
-#   bert          google-bert/bert-base-uncased            110M     Classic baseline, [CLS] pooling
-#   roberta       FacebookAI/roberta-base                  125M     Stronger than BERT, no NSP
-#   deberta       microsoft/deberta-v3-base                184M     Best single-model on GLUE/SQuAD
-#   electra       google/electra-base-discriminator        110M     Fast & efficient, replaced-token detection
-#
+#  ┌─────────┬─────────────────────────────────────────┬────────┬──────────┐
+#  │  Key    │  HuggingFace ID                         │ Params │ AMP      │
+#  ├─────────┼─────────────────────────────────────────┼────────┼──────────┤
+#  │ bert    │ google-bert/bert-base-uncased            │ 110M   │ float16  │
+#  │ roberta │ FacebookAI/roberta-base                  │ 125M   │ float16  │
+#  │ deberta │ microsoft/deberta-v3-base                │ 184M   │ bfloat16 │ ← fp16 internal params
+#  │ electra │ google/electra-base-discriminator        │ 110M   │ float16  │
+#  └─────────┴─────────────────────────────────────────┴────────┴──────────┘
 model:
   name: "deberta"                            # bert | roberta | deberta | electra
   dropout: 0.1
 
 #  Training
 training:
-  epochs: 10
+  epochs: 20
   batch_size: 32
   lr: 2.0e-5
   weight_decay: 0.01
   optimizer: "adamw"                         # adamw | adam | sgd
   scheduler: "cosine_warmup"                 # cosine_warmup | cosine | step | none
-  warmup_ratio: 0.1                          # fraction of total steps used for linear warmup
+  warmup_ratio: 0.1
   step_size: 3                               # (only if scheduler == step)
   gamma: 0.1                                 # (only if scheduler == step)
-  early_stopping_patience: 3
+  early_stopping_patience: 5
 
   # ---- Threshold ---------------------------------------------------------------
-  threshold: 0.5                             # sigmoid threshold for positive prediction
-                                             # if no class > threshold -> predict Neutral
+  threshold: 0.5                             # run threshold sweep (notebook §5) after train
 
   # ---- Loss --------------------------------------------------------------------
   loss: "asymmetric"                         # bce | bce_weighted | focal_bce | asymmetric
-  focal_gamma: 2.0                           # focal_bce: gamma
-  asl_gamma_pos: 0.0                         # asymmetric: focusing on positives (0 = no focus)
-  asl_gamma_neg: 4.0                         # asymmetric: stronger focus on easy negatives
-  asl_clip: 0.05                             # asymmetric: probability margin clipping
 
-  # ---- Class weights (auto-computed if null) -----------------------------------
-  # Set to null to auto-compute pos_weight from training set label frequencies.
-  # Or provide a list of 27 floats (one per emotion class, in label order).
+  focal_gamma: 2.0                           # focal_bce only
+
+  # ASL — tuned to fix high-recall / low-precision problem:
+  #   gamma_pos: 1.0  → penalise hard false-negatives (was 0.0 = plain BCE for pos)
+  #   gamma_neg: 2.0  → gentle down-weight of easy negatives (was 4.0 → over-suppressed)
+  #   clip: 0.0       → no probability shift (was 0.05 → caused precision collapse)
+  asl_gamma_pos: 1.0
+  asl_gamma_neg: 2.0
+  asl_clip: 0.0
+
+  # pos_weight: null → auto-computed from training set label frequencies
   pos_weight: null
 
 #  Results
 results:
-  base_dir: "results/"                       # outputs go to results/<model.name>/
+  base_dir: "results/"
