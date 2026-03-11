@@ -2,7 +2,7 @@ import pandas as pd
 
 # đọc file txt (tab separated)
 df = pd.read_csv(
-    r"D:\USTH\nlp\final_prj\data\SemEval2018-Task1-all-data\English\E-c\2018-E-c-En-train.txt",
+    r"D:\USTH\nlp\NLP_SemEval_36\data\2018-E-c-En-train.txt",
     sep="\t"
 )
 
