@@ -259,8 +259,8 @@ def train(config_path: str = "config/config.yaml") -> Dict:
     # ── Data ────────────────────────────────────────────────────────────────
     train_loader, val_loader, _, info = get_dataloaders(cfg)
     pos_weight  = info["pos_weight"]
-    num_labels  = info["num_labels"]
-    label_names = info["label_names"]
+    num_labels  = len(info["emotion_names"])
+    label_names = info["emotion_names"]
 
     # ── Model ───────────────────────────────────────────────────────────────
     # Override num_labels in cfg so build_model picks up the right head size
@@ -270,7 +270,7 @@ def train(config_path: str = "config/config.yaml") -> Dict:
     pretrained_name = BACKBONE_REGISTRY[model_name.lower()]["pretrained"]
     n_params   = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[train] Model     : {model_name}  ({pretrained_name})")
-    print(f"[train] Num labels: {num_labels}  ({info['label_mode']})")
+    print(f"[train] Num labels: {num_labels}  {label_names}")
     print(f"[train] Params    : {n_params:,}")
 
     # ── Loss / Optimizer / Scheduler ────────────────────────────────────────
@@ -349,8 +349,7 @@ def train(config_path: str = "config/config.yaml") -> Dict:
             torch.save({
                 "epoch":           epoch,
                 "model_name":      model_name,
-                "pretrained_name": pretrained_name,   # no need to read config on load
-                "label_mode":      info["label_mode"],
+                "pretrained_name": pretrained_name,
                 "num_labels":      num_labels,
                 "label_names":     label_names,
                 "model_state":     model.state_dict(),
