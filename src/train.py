@@ -56,18 +56,20 @@ from models.loss import get_loss_fn
 
 class EncoderForMultiLabelClassification(nn.Module):
     """
-    Generic encoder-only backbone with a multi-label classification head.
+    Generic encoder-only backbone với 11 binary classifier heads độc lập.
 
-    Supports: bert | roberta | deberta | electra
-    All share the same interface:
-        backbone  ->  [CLS] hidden state  ->  Dropout  ->  Linear(hidden, 27)
+    Architecture:
+        backbone  ->  [CLS] hidden state  ->  Dropout
+                  ->  [head_0(hidden,1), head_1(hidden,1), ..., head_10(hidden,1)]
+                  ->  concat  ->  (B, 11) logits
 
-    The head outputs raw logits (no sigmoid). Apply sigmoid at inference.
+    Mỗi head là một binary classifier riêng biệt cho một emotion.
+    Dùng sigmoid + per-class threshold khi inference, không dùng chung 1 threshold.
 
     Args:
-        pretrained_name: HuggingFace model ID or local path.
-        num_labels:      Number of emotion classes (27).
-        dropout:         Dropout rate before the classifier.
+        pretrained_name: HuggingFace model ID hoặc local path.
+        num_labels:      Số emotion classes (11).
+        dropout:         Dropout trước mỗi classifier head.
     """
 
     def __init__(
@@ -77,9 +79,14 @@ class EncoderForMultiLabelClassification(nn.Module):
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
-        self.backbone   = AutoModel.from_pretrained(pretrained_name)
-        self.dropout    = nn.Dropout(dropout)
-        self.classifier = nn.Linear(self.backbone.config.hidden_size, num_labels)
+        self.backbone     = AutoModel.from_pretrained(pretrained_name)
+        self.dropout      = nn.Dropout(dropout)
+        hidden_size       = self.backbone.config.hidden_size
+        # 11 independent binary heads — each outputs 1 logit
+        self.classifiers  = nn.ModuleList([
+            nn.Linear(hidden_size, 1) for _ in range(num_labels)
+        ])
+        self.num_labels = num_labels
 
     def forward(
         self,
@@ -88,27 +95,28 @@ class EncoderForMultiLabelClassification(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            input_ids:      (B, L) token ids.
-            attention_mask: (B, L) 1 for real tokens, 0 for padding.
+            input_ids:      (B, L)
+            attention_mask: (B, L)
 
         Returns:
-            logits: (B, num_labels) raw scores.
+            logits: (B, num_labels)  — raw scores, one per emotion head.
         """
         outputs    = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
-        # All 4 backbones expose last_hidden_state; use [CLS] at position 0
-        cls_output = outputs.last_hidden_state[:, 0, :]
+        cls_output = outputs.last_hidden_state[:, 0, :]          # (B, hidden)
         cls_output = self.dropout(cls_output)
-        return self.classifier(cls_output)
+
+        # Each head: (B, hidden) -> (B, 1); concat along dim=1 -> (B, 11)
+        logits = torch.cat(
+            [head(cls_output) for head in self.classifiers], dim=1
+        )
+        return logits
 
 
 def build_model(cfg: dict) -> EncoderForMultiLabelClassification:
     """
-    Instantiate the model from config.
-
-    Reads ``cfg['model']['name']`` to look up the HuggingFace pretrained ID
-    from BACKBONE_REGISTRY in dataloader.py.
-
-    Supported names: bert | roberta | deberta | electra
+    Instantiate model từ config.
+    Mỗi emotion class có 1 binary classifier head riêng (ModuleList).
+    Supported: bert | roberta | deberta | electra
     """
     name = cfg["model"]["name"].lower()
     if name not in BACKBONE_REGISTRY:

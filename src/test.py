@@ -45,7 +45,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from src.dataloader import get_dataloaders, EMOTION_NAMES, NUM_EMOTIONS
-from src.utils import get_result_dir, load_config, set_seed, apply_threshold
+from src.utils import get_result_dir, load_config, set_seed, apply_threshold, find_best_thresholds
 from src.train import build_model
 
 
@@ -81,7 +81,33 @@ def _plot_per_class_f1(
     plt.close(fig)
 
 
-def _plot_prediction_heatmap(
+def _plot_thresholds(
+    thresholds:  np.ndarray,
+    class_names: list,
+    save_path:   str,
+) -> None:
+    """Bar chart showing the best threshold found per class."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+    y_pos   = np.arange(len(class_names))
+    colors  = ["#e74c3c" if t < 0.4 else "#2ecc71" if t > 0.6 else "#3498db"
+               for t in thresholds]
+    ax.barh(y_pos, thresholds, align="center", color=colors, edgecolor="white")
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(class_names, fontsize=9)
+    ax.invert_yaxis()
+    ax.axvline(0.5, color="black", linestyle="--", linewidth=1, label="default=0.5")
+    ax.set_xlabel("Best Threshold (val F1)")
+    ax.set_title("Per-Class Optimal Threshold")
+    ax.set_xlim(0, 1.0)
+    ax.legend(fontsize=8)
+    for y, val in zip(y_pos, thresholds):
+        ax.text(val + 0.01, y, f"{val:.2f}", va="center", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+
     probs: np.ndarray,
     labels: np.ndarray,
     class_names: list,
@@ -120,25 +146,24 @@ def _plot_prediction_heatmap(
 
 def evaluate(config_path: str = "config/config.yaml") -> Dict:
     """
-    Load best checkpoint and evaluate on test set.
+    Load best checkpoint, tìm per-class threshold tốt nhất trên val set,
+    sau đó evaluate trên test set với các threshold đó.
 
     Returns dict with keys:
-        micro_f1, macro_f1, weighted_f1,
-        hamming, subset_accuracy,
+        micro_f1, macro_f1, weighted_f1, hamming, subset_accuracy,
+        best_thresholds (np.ndarray shape (C,)),
         report_path, metrics_csv_path, per_class_csv_path,
-        f1_chart_path, heatmap_path.
+        f1_chart_path, heatmap_path, threshold_chart_path.
     """
     cfg = load_config(config_path)
     set_seed(cfg["data"]["seed"])
 
-    threshold  = float(cfg["training"].get("threshold", 0.5))
     model_name = cfg["model"]["name"]
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[test] Device: {device}")
 
-    # ── Data ────────────────────────────────────────────────────────────────
-    _, _, test_loader, info = get_dataloaders(cfg)
+    # ── Data — cần cả val lẫn test ──────────────────────────────────────────
+    _, val_loader, test_loader, info = get_dataloaders(cfg)
 
     # ── Load checkpoint ──────────────────────────────────────────────────────
     ckpt_path = os.path.join("checkpoints", model_name, "best.pth")
@@ -151,35 +176,45 @@ def evaluate(config_path: str = "config/config.yaml") -> Dict:
     model = build_model(cfg).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
-
-    ckpt_threshold = ckpt.get("threshold", threshold)
     print(f"[test] Loaded epoch {ckpt.get('epoch','?')}  "
-          f"val_loss={ckpt.get('val_loss', float('nan')):.4f}  "
-          f"threshold={ckpt_threshold}")
-    threshold = ckpt_threshold
+          f"val_loss={ckpt.get('val_loss', float('nan')):.4f}")
 
-    # ── Inference ────────────────────────────────────────────────────────────
-    all_probs:  list = []
-    all_labels: list = []
+    # ── Helper: run inference on any loader ──────────────────────────────────
+    def _infer(loader, desc: str):
+        probs_list, labels_list = [], []
+        pbar = tqdm(loader, desc=desc, leave=True, dynamic_ncols=True, unit="batch")
+        with torch.no_grad():
+            for batch in pbar:
+                logits = model(
+                    batch["input_ids"].to(device,      non_blocking=True),
+                    batch["attention_mask"].to(device, non_blocking=True),
+                )
+                probs_list.append(torch.sigmoid(logits).cpu().numpy())
+                labels_list.append(batch["labels"].numpy())
+        pbar.close()
+        return np.vstack(probs_list), np.vstack(labels_list)
 
-    pbar = tqdm(test_loader, desc="Testing", leave=True, dynamic_ncols=True, unit="batch")
-    with torch.no_grad():
-        for batch in pbar:
-            input_ids      = batch["input_ids"].to(device,      non_blocking=True)
-            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            labels         = batch["labels"]
+    # ── Step 1: Per-class threshold search on VAL set ────────────────────────
+    print("\n[test] Searching best per-class threshold on validation set...")
+    val_probs, val_labels = _infer(val_loader, "Val inference")
 
-            logits = model(input_ids, attention_mask)
-            probs  = torch.sigmoid(logits).cpu().numpy()
+    best_thresholds = find_best_thresholds(
+        val_probs, val_labels,
+        candidates=np.arange(0.05, 0.95, 0.05),
+        metric="f1",
+    )
 
-            all_probs.append(probs)
-            all_labels.append(labels.numpy())
+    print(f"[test] Per-class best thresholds:")
+    for i, (name, t) in enumerate(zip(EMOTION_NAMES, best_thresholds)):
+        val_f1 = f1_score(val_labels[:, i], (val_probs[:, i] >= t).astype(int), zero_division=0)
+        print(f"  {name:<15}: threshold={t:.2f}  val_F1={val_f1:.4f}")
 
-    pbar.close()
+    # ── Step 2: Inference on TEST set ────────────────────────────────────────
+    print("\n[test] Running inference on test set...")
+    all_probs, all_labels = _infer(test_loader, "Test  inference")
 
-    all_probs  = np.vstack(all_probs)                         # (N, 11)
-    all_labels = np.vstack(all_labels)                        # (N, 11)
-    all_preds  = apply_threshold(all_probs, threshold)        # (N, 11)
+    # Apply per-class thresholds — shape broadcast (N,C) >= (C,)
+    all_preds = apply_threshold(all_probs, best_thresholds)   # (N, 11)
 
     # ── Aggregate metrics ────────────────────────────────────────────────────
     micro_f1    = f1_score(all_labels, all_preds, average="micro",    zero_division=0)
@@ -219,8 +254,10 @@ def evaluate(config_path: str = "config/config.yaml") -> Dict:
     with open(report_path, "w") as f:
         f.write(f"Model          : {model_name}\n")
         f.write(f"Checkpoint epoch: {ckpt.get('epoch','?')}\n")
-        f.write(f"Threshold      : {threshold}\n\n")
-        f.write(f"Micro  F1      : {micro_f1:.4f}\n")
+        f.write(f"Per-class thresholds (optimised on val set):\n")
+        for name, t in zip(EMOTION_NAMES, best_thresholds):
+            f.write(f"  {name:<15}: {t:.2f}\n")
+        f.write(f"\nMicro  F1      : {micro_f1:.4f}\n")
         f.write(f"Macro  F1      : {macro_f1:.4f}\n")
         f.write(f"Weighted F1    : {weighted_f1:.4f}\n")
         f.write(f"Hamming Loss   : {hamming:.4f}\n")
@@ -232,13 +269,12 @@ def evaluate(config_path: str = "config/config.yaml") -> Dict:
     metrics_csv = os.path.join(result_dir, "test_metrics.csv")
     with open(metrics_csv, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=[
-            "model", "threshold", "micro_f1", "macro_f1", "weighted_f1",
+            "model", "micro_f1", "macro_f1", "weighted_f1",
             "hamming_loss", "subset_accuracy", "best_epoch",
         ])
         writer.writeheader()
         writer.writerow({
             "model":           model_name,
-            "threshold":       threshold,
             "micro_f1":        round(micro_f1,    4),
             "macro_f1":        round(macro_f1,    4),
             "weighted_f1":     round(weighted_f1, 4),
@@ -247,17 +283,20 @@ def evaluate(config_path: str = "config/config.yaml") -> Dict:
             "best_epoch":      ckpt.get("epoch", "?"),
         })
 
-    # 3. Per-class metrics CSV
+    # 3. Per-class metrics CSV (includes best threshold per class)
     per_class_csv = os.path.join(result_dir, "per_class_metrics.csv")
     with open(per_class_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["emotion", "precision", "recall", "f1", "support"])
+        writer = csv.DictWriter(f, fieldnames=[
+            "emotion", "threshold", "precision", "recall", "f1", "support"
+        ])
         writer.writeheader()
         for i, name in enumerate(EMOTION_NAMES):
             writer.writerow({
                 "emotion":   name,
-                "precision": round(float(per_class_p[i]),   4),
-                "recall":    round(float(per_class_r[i]),   4),
-                "f1":        round(float(per_class_f1[i]),  4),
+                "threshold": round(float(best_thresholds[i]), 2),
+                "precision": round(float(per_class_p[i]),     4),
+                "recall":    round(float(per_class_r[i]),     4),
+                "f1":        round(float(per_class_f1[i]),    4),
                 "support":   int(per_class_sup[i]),
             })
 
@@ -265,27 +304,34 @@ def evaluate(config_path: str = "config/config.yaml") -> Dict:
     f1_chart_path = os.path.join(result_dir, "per_class_f1.png")
     _plot_per_class_f1(per_class_f1, EMOTION_NAMES, f1_chart_path)
 
-    # 5. Prediction heatmap
+    # 5. Per-class threshold chart
+    threshold_chart_path = os.path.join(result_dir, "per_class_thresholds.png")
+    _plot_thresholds(best_thresholds, EMOTION_NAMES, threshold_chart_path)
+
+    # 6. Prediction heatmap
     heatmap_path = os.path.join(result_dir, "prediction_heatmap.png")
     _plot_prediction_heatmap(all_probs, all_labels, EMOTION_NAMES, heatmap_path)
 
-    print(f"\n[test] Report          -> {report_path}")
-    print(f"[test] Metrics CSV     -> {metrics_csv}")
-    print(f"[test] Per-class CSV   -> {per_class_csv}")
-    print(f"[test] F1 bar chart    -> {f1_chart_path}")
-    print(f"[test] Heatmap         -> {heatmap_path}")
+    print(f"\n[test] Report            -> {report_path}")
+    print(f"[test] Metrics CSV       -> {metrics_csv}")
+    print(f"[test] Per-class CSV     -> {per_class_csv}")
+    print(f"[test] F1 bar chart      -> {f1_chart_path}")
+    print(f"[test] Threshold chart   -> {threshold_chart_path}")
+    print(f"[test] Heatmap           -> {heatmap_path}")
 
     return {
-        "micro_f1":           micro_f1,
-        "macro_f1":           macro_f1,
-        "weighted_f1":        weighted_f1,
-        "hamming":            hamming,
-        "subset_accuracy":    subset_acc,
-        "report_path":        report_path,
-        "metrics_csv_path":   metrics_csv,
-        "per_class_csv_path": per_class_csv,
-        "f1_chart_path":     f1_chart_path,
-        "heatmap_path":      heatmap_path,
+        "micro_f1":              micro_f1,
+        "macro_f1":              macro_f1,
+        "weighted_f1":           weighted_f1,
+        "hamming":               hamming,
+        "subset_accuracy":       subset_acc,
+        "best_thresholds":       best_thresholds,
+        "report_path":           report_path,
+        "metrics_csv_path":      metrics_csv,
+        "per_class_csv_path":    per_class_csv,
+        "f1_chart_path":         f1_chart_path,
+        "threshold_chart_path":  threshold_chart_path,
+        "heatmap_path":          heatmap_path,
     }
 
 

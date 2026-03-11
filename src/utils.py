@@ -168,32 +168,76 @@ def get_result_dir(cfg: dict) -> str:
 ###############################################################################
 
 def apply_threshold(
-    probs: np.ndarray,
-    threshold: float = 0.5,
-    neutral_label_idx: Optional[int] = None,
-    num_emotions: int = 27,
+    probs:     np.ndarray,
+    threshold: "float | np.ndarray" = 0.5,
 ) -> np.ndarray:
     """
-    Convert probability matrix to binary predictions with Neutral fallback.
+    Convert probability matrix to binary predictions.
 
     Args:
-        probs:             (N, 27) sigmoid probabilities.
-        threshold:         Decision threshold.
-        neutral_label_idx: If provided, samples where no emotion exceeds threshold
-                           are assigned Neutral (as a separate indicator).
-        num_emotions:      Number of emotion columns (27).
+        probs:     (N, C) sigmoid probabilities.
+        threshold: Scalar float  → same threshold for all classes.
+                   np.ndarray (C,) → per-class threshold (preferred).
 
     Returns:
-        preds: (N, 27) binary array — 1 if prob > threshold, else 0.
-               Neutral is NOT added as a column; callers check row-sum == 0.
+        preds: (N, C) int32 array — 1 if prob >= threshold, else 0.
     """
-    preds = (probs >= threshold).astype(np.int32)
-    return preds
+    return (probs >= threshold).astype(np.int32)
+
+
+def find_best_thresholds(
+    probs:      np.ndarray,
+    labels:     np.ndarray,
+    candidates: np.ndarray = None,
+    metric:     str = "f1",
+) -> np.ndarray:
+    """
+    For each class independently, sweep candidate thresholds and return
+    the one that maximises the chosen metric on the given split (val set).
+
+    Args:
+        probs:      (N, C) sigmoid probabilities on the validation set.
+        labels:     (N, C) ground-truth binary labels.
+        candidates: 1-D array of thresholds to try.
+                    Default: np.arange(0.05, 0.95, 0.05)
+        metric:     "f1" (default) | "precision" | "recall"
+                    Per-class binary metric to optimise.
+
+    Returns:
+        best_thresholds: np.ndarray of shape (C,), one threshold per class.
+
+    Example::
+        best_t = find_best_thresholds(val_probs, val_labels)
+        preds  = apply_threshold(test_probs, best_t)
+    """
+    from sklearn.metrics import f1_score, precision_score, recall_score
+
+    if candidates is None:
+        candidates = np.arange(0.05, 0.95, 0.05)
+
+    score_fn = {
+        "f1":        lambda y, p: f1_score(y, p,        zero_division=0),
+        "precision": lambda y, p: precision_score(y, p, zero_division=0),
+        "recall":    lambda y, p: recall_score(y, p,    zero_division=0),
+    }[metric]
+
+    num_classes      = probs.shape[1]
+    best_thresholds  = np.full(num_classes, 0.5)
+
+    for c in range(num_classes):
+        best_score = -1.0
+        best_t     = 0.5
+        for t in candidates:
+            preds_c = (probs[:, c] >= t).astype(int)
+            score   = score_fn(labels[:, c], preds_c)
+            if score > best_score:
+                best_score = score
+                best_t     = t
+        best_thresholds[c] = best_t
+
+    return best_thresholds
 
 
 def is_neutral(preds: np.ndarray) -> np.ndarray:
-    """
-    Return boolean mask of shape (N,): True where sample has no predicted emotion.
-    These samples are considered Neutral.
-    """
+    """Return boolean mask (N,): True where sample has no predicted emotion."""
     return preds.sum(axis=1) == 0
