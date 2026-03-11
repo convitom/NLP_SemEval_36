@@ -1,6 +1,6 @@
 """
 src/test.py
-Evaluation script for GoEmotions Multi-Label Emotion Classification.
+Evaluation script for SemEval 2018 Task 1 Multi-Label Emotion Classification.
 
 Loads the best checkpoint, runs inference on the held-out test set,
 and writes a full report to results/<model_name>/.
@@ -9,7 +9,8 @@ Outputs:
   - test_report.txt          per-class precision / recall / F1
   - test_metrics.csv         micro/macro/weighted F1, hamming loss, subset accuracy
   - per_class_metrics.csv    per-emotion P/R/F1/support
-  - confusion_matrix.png     per-class predicted vs true counts (heatmap)
+  - per_class_f1.png         bar chart of per-class F1
+  - prediction_heatmap.png   probability heatmap over test subset
 
 CLI:
   python src/test.py
@@ -43,8 +44,8 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from src.dataloader import get_dataloaders, EMOTION_NAMES, NUM_EMOTIONS, NEUTRAL_LABEL_IDX
-from src.utils import get_result_dir, load_config, set_seed, apply_threshold, is_neutral
+from src.dataloader import get_dataloaders, EMOTION_NAMES, NUM_EMOTIONS
+from src.utils import get_result_dir, load_config, set_seed, apply_threshold
 from src.train import build_model
 
 
@@ -124,7 +125,6 @@ def evaluate(config_path: str = "config/config.yaml") -> Dict:
     Returns dict with keys:
         micro_f1, macro_f1, weighted_f1,
         hamming, subset_accuracy,
-        neutral_accuracy,
         report_path, metrics_csv_path, per_class_csv_path,
         f1_chart_path, heatmap_path.
     """
@@ -152,7 +152,6 @@ def evaluate(config_path: str = "config/config.yaml") -> Dict:
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    # Use threshold saved with checkpoint if not overridden
     ckpt_threshold = ckpt.get("threshold", threshold)
     print(f"[test] Loaded epoch {ckpt.get('epoch','?')}  "
           f"val_loss={ckpt.get('val_loss', float('nan')):.4f}  "
@@ -178,9 +177,9 @@ def evaluate(config_path: str = "config/config.yaml") -> Dict:
 
     pbar.close()
 
-    all_probs  = np.vstack(all_probs)    # (N, 27)
-    all_labels = np.vstack(all_labels)   # (N, 27)
-    all_preds  = apply_threshold(all_probs, threshold)   # (N, 27)
+    all_probs  = np.vstack(all_probs)                         # (N, 11)
+    all_labels = np.vstack(all_labels)                        # (N, 11)
+    all_preds  = apply_threshold(all_probs, threshold)        # (N, 11)
 
     # ── Aggregate metrics ────────────────────────────────────────────────────
     micro_f1    = f1_score(all_labels, all_preds, average="micro",    zero_division=0)
@@ -188,14 +187,6 @@ def evaluate(config_path: str = "config/config.yaml") -> Dict:
     weighted_f1 = f1_score(all_labels, all_preds, average="weighted", zero_division=0)
     hamming     = hamming_loss(all_labels, all_preds)
     subset_acc  = float((all_preds == all_labels).all(axis=1).mean())
-
-    # Neutral accuracy: fraction of all-zero ground-truth rows correctly predicted as all-zero
-    true_neutral_mask = all_labels.sum(axis=1) == 0
-    pred_neutral_mask = is_neutral(all_preds)
-    if true_neutral_mask.sum() > 0:
-        neutral_acc = float((true_neutral_mask & pred_neutral_mask).sum() / true_neutral_mask.sum())
-    else:
-        neutral_acc = float("nan")
 
     # Per-class metrics
     per_class_f1  = f1_score(all_labels,  all_preds, average=None, zero_division=0)
@@ -216,7 +207,6 @@ def evaluate(config_path: str = "config/config.yaml") -> Dict:
     print(f"  Weighted F1      : {weighted_f1:.4f}")
     print(f"  Hamming Loss     : {hamming:.4f}")
     print(f"  Subset Accuracy  : {subset_acc:.4f}")
-    print(f"  Neutral Accuracy : {neutral_acc:.4f}")
     print("=" * 62)
     print("\nPer-class Classification Report:\n")
     print(report)
@@ -234,8 +224,7 @@ def evaluate(config_path: str = "config/config.yaml") -> Dict:
         f.write(f"Macro  F1      : {macro_f1:.4f}\n")
         f.write(f"Weighted F1    : {weighted_f1:.4f}\n")
         f.write(f"Hamming Loss   : {hamming:.4f}\n")
-        f.write(f"Subset Accuracy: {subset_acc:.4f}\n")
-        f.write(f"Neutral Accuracy: {neutral_acc:.4f}\n\n")
+        f.write(f"Subset Accuracy: {subset_acc:.4f}\n\n")
         f.write("Per-class Classification Report:\n")
         f.write(report)
 
@@ -244,19 +233,18 @@ def evaluate(config_path: str = "config/config.yaml") -> Dict:
     with open(metrics_csv, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=[
             "model", "threshold", "micro_f1", "macro_f1", "weighted_f1",
-            "hamming_loss", "subset_accuracy", "neutral_accuracy", "best_epoch",
+            "hamming_loss", "subset_accuracy", "best_epoch",
         ])
         writer.writeheader()
         writer.writerow({
-            "model":            model_name,
-            "threshold":        threshold,
-            "micro_f1":         round(micro_f1,    4),
-            "macro_f1":         round(macro_f1,    4),
-            "weighted_f1":      round(weighted_f1, 4),
-            "hamming_loss":     round(hamming,     4),
-            "subset_accuracy":  round(subset_acc,  4),
-            "neutral_accuracy": round(neutral_acc, 4) if not np.isnan(neutral_acc) else "N/A",
-            "best_epoch":       ckpt.get("epoch", "?"),
+            "model":           model_name,
+            "threshold":       threshold,
+            "micro_f1":        round(micro_f1,    4),
+            "macro_f1":        round(macro_f1,    4),
+            "weighted_f1":     round(weighted_f1, 4),
+            "hamming_loss":    round(hamming,     4),
+            "subset_accuracy": round(subset_acc,  4),
+            "best_epoch":      ckpt.get("epoch", "?"),
         })
 
     # 3. Per-class metrics CSV
@@ -288,14 +276,13 @@ def evaluate(config_path: str = "config/config.yaml") -> Dict:
     print(f"[test] Heatmap         -> {heatmap_path}")
 
     return {
-        "micro_f1":          micro_f1,
-        "macro_f1":          macro_f1,
-        "weighted_f1":       weighted_f1,
-        "hamming":           hamming,
-        "subset_accuracy":   subset_acc,
-        "neutral_accuracy":  neutral_acc,
-        "report_path":       report_path,
-        "metrics_csv_path":  metrics_csv,
+        "micro_f1":           micro_f1,
+        "macro_f1":           macro_f1,
+        "weighted_f1":        weighted_f1,
+        "hamming":            hamming,
+        "subset_accuracy":    subset_acc,
+        "report_path":        report_path,
+        "metrics_csv_path":   metrics_csv,
         "per_class_csv_path": per_class_csv,
         "f1_chart_path":     f1_chart_path,
         "heatmap_path":      heatmap_path,
